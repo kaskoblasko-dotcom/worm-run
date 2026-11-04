@@ -15,7 +15,7 @@ const PauseScript = preload("res://scripts/pause_menu.gd")
 
 # >>> After you deploy to Render, put your server address here <<<
 # (for testing on your own computer use "ws://127.0.0.1:10000")
-const SERVER_URL := "wss://YOUR-APP-NAME.onrender.com"
+const SERVER_URL := "https://worm-run.onrender.com"
 
 const DEFAULT_PORT := 10000
 const MAX_ROOMS := 20
