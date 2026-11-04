@@ -7,8 +7,11 @@ extends Node2D
 # The server keeps accounts and many rooms. Each room has its own world,
 # worms and players. Players join a room with a 4-letter code.
 
-const WorldScript = preload("res://world.gd")
-const MenuScript = preload("res://menu.gd")
+const WorldScript = preload("res://scripts/world.gd")
+const MenuScript = preload("res://scripts/menu.gd")
+const UITheme = preload("res://scripts/ui_theme.gd")
+const TouchScript = preload("res://scripts/touch_controls.gd")
+const PauseScript = preload("res://scripts/pause_menu.gd")
 
 # >>> After you deploy to Render, put your server address here <<<
 # (for testing on your own computer use "ws://127.0.0.1:10000")
@@ -82,9 +85,19 @@ var hud_label: Label
 var board_label: Label
 var help_label: Label
 var toast_label: Label
+var hud_panel: PanelContainer
+var board_panel: PanelContainer
+var toast_panel: PanelContainer
+var ui_theme: Theme
+var touch: Control
+var pause_menu: Control
+var rotate_overlay: ColorRect
 
 # ---- client state ----
 var in_game := false
+var paused := false
+var use_touch_ui := false
+var aim_world := Vector2.ZERO
 var connected := false
 var connecting := false
 var retrying := false
@@ -131,16 +144,46 @@ func _ready() -> void:
 	camera.position_smoothing_speed = 10.0
 	add_child(camera)
 
+	ui_theme = UITheme.build()
 	ui = CanvasLayer.new()
 	add_child(ui)
 	_build_hud()
+
+	touch = TouchScript.new()
+	ui.add_child(touch)
+	touch.pause_pressed.connect(func(): _set_paused(true))
+
+	pause_menu = PauseScript.new()
+	pause_menu.visible = false
+	ui.add_child(pause_menu)
+	pause_menu.resume_requested.connect(func(): _set_paused(false))
+	pause_menu.leave_requested.connect(_leave_to_rooms)
+	pause_menu.copy_requested.connect(_on_copy_code)
 
 	menu = MenuScript.new()
 	ui.add_child(menu)
 	menu.signup_requested.connect(_on_signup_requested)
 	menu.login_requested.connect(_on_login_requested)
+	menu.logout_requested.connect(_on_logout_requested)
 	menu.create_room_requested.connect(_on_create_room_requested)
 	menu.join_room_requested.connect(_on_join_room_requested)
+	menu.settings_changed.connect(_apply_settings)
+
+	rotate_overlay = ColorRect.new()
+	rotate_overlay.color = Color(0.04, 0.06, 0.10, 0.97)
+	rotate_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	rotate_overlay.visible = false
+	ui.add_child(rotate_overlay)
+	var rotate_label := Label.new()
+	rotate_label.text = "Please rotate your device\nto landscape"
+	rotate_label.theme = ui_theme
+	rotate_label.add_theme_font_size_override("font_size", 36)
+	rotate_label.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	rotate_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	rotate_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	rotate_overlay.add_child(rotate_label)
+
+	_apply_settings()
 
 	multiplayer.connected_to_server.connect(_on_connected)
 	multiplayer.connection_failed.connect(_on_connection_failed)
@@ -164,17 +207,45 @@ func _make_label(font_size: int) -> Label:
 	return l
 
 
-func _build_hud() -> void:
-	hud_label = _make_label(18)
-	hud_label.position = Vector2(12, 8)
+func _hud_panel() -> PanelContainer:
+	var p := PanelContainer.new()
+	p.theme = ui_theme
+	p.theme_type_variation = "HudPanel"
+	p.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	p.visible = false
+	ui.add_child(p)
+	return p
 
-	board_label = _make_label(16)
-	board_label.anchor_left = 1.0
-	board_label.anchor_right = 1.0
-	board_label.offset_left = -300.0
-	board_label.offset_right = -12.0
-	board_label.offset_top = 8.0
+
+func _hud_text(parent: Control, font_size: int) -> Label:
+	var l := Label.new()
+	l.add_theme_font_size_override("font_size", font_size)
+	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	parent.add_child(l)
+	return l
+
+
+func _build_hud() -> void:
+	hud_panel = _hud_panel()
+	hud_panel.position = Vector2(12, 8)
+	hud_label = _hud_text(hud_panel, 18)
+
+	board_panel = _hud_panel()
+	board_panel.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	board_panel.grow_horizontal = Control.GROW_DIRECTION_BEGIN
+	board_panel.offset_left = -12.0
+	board_panel.offset_right = -12.0
+	board_panel.offset_top = 8.0
+	board_panel.custom_minimum_size = Vector2(190, 0)
+	board_label = _hud_text(board_panel, 16)
 	board_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+
+	toast_panel = _hud_panel()
+	toast_panel.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	toast_panel.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	toast_panel.offset_top = 72.0
+	toast_label = _hud_text(toast_panel, 22)
+	toast_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 
 	help_label = _make_label(14)
 	help_label.anchor_top = 1.0
@@ -183,27 +254,67 @@ func _build_hud() -> void:
 	help_label.offset_bottom = -6.0
 	help_label.offset_left = 12.0
 	help_label.offset_right = 900.0
-	help_label.text = "A/D move  |  W/Space jump  |  Left click: break  |  Right click: place  |  Esc: leave room"
-
-	toast_label = _make_label(22)
-	toast_label.anchor_left = 0.0
-	toast_label.anchor_right = 1.0
-	toast_label.offset_top = 70.0
-	toast_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	help_label.text = "A/D move  |  W/Space jump  |  Left click: break  |  Right click: place  |  Esc: menu"
 
 
 func _set_hud_visible(v: bool) -> void:
-	hud_label.visible = v
-	board_label.visible = v
-	help_label.visible = v
+	hud_panel.visible = v
+	board_panel.visible = v
+	help_label.visible = v and not use_touch_ui
 	if not v:
-		toast_label.visible = false
+		toast_panel.visible = false
 
 
 func _toast(text: String) -> void:
 	toast_label.text = text
-	toast_label.visible = true
+	toast_panel.visible = true
 	toast_time = 3.0
+
+
+func _detect_touch() -> bool:
+	if OS.has_feature("android") or OS.has_feature("ios") or OS.has_feature("web_android") or OS.has_feature("web_ios"):
+		return true
+	if OS.has_feature("web"):
+		return bool(JavaScriptBridge.eval("(navigator.maxTouchPoints || 0) > 0 && window.matchMedia('(pointer: coarse)').matches"))
+	return false
+
+
+func _apply_settings() -> void:
+	var zooms: Array = [2.5, 2.0, 1.5]
+	var z: float = zooms[menu.zoom_level]
+	camera.zoom = Vector2(z, z)
+	match menu.touch_mode:
+		1:
+			use_touch_ui = true
+		2:
+			use_touch_ui = false
+		_:
+			use_touch_ui = _detect_touch()
+	help_label.visible = in_game and not use_touch_ui
+	_refresh_touch()
+
+
+func _refresh_touch() -> void:
+	touch.set_active(use_touch_ui and in_game and not paused)
+
+
+func _set_paused(v: bool) -> void:
+	paused = v and in_game
+	if paused:
+		pause_menu.open(room_code)
+	else:
+		pause_menu.close()
+	_refresh_touch()
+
+
+func _on_copy_code() -> void:
+	DisplayServer.clipboard_set(room_code)
+	_toast("Room code %s copied!" % room_code)
+
+
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_WM_GO_BACK_REQUEST and in_game:
+		_set_paused(not paused)
 
 
 # =====================================================================
@@ -216,7 +327,7 @@ func _connect_to_server() -> void:
 	var err := peer.create_client(SERVER_URL)
 	if err != OK:
 		attempts = 999
-		menu.show_connecting("The server address (SERVER_URL in main.gd) is not valid.")
+		menu.show_connecting("The server address (SERVER_URL in scripts/main.gd) is not valid.")
 		return
 	multiplayer.multiplayer_peer = peer
 	connecting = true
@@ -229,7 +340,7 @@ func _schedule_retry(message: String) -> void:
 	connected = false
 	multiplayer.multiplayer_peer = null
 	if attempts >= 40:
-		menu.show_connecting("Could not reach the server. Check SERVER_URL in main.gd, then restart the game.")
+		menu.show_connecting("Could not reach the server. Check SERVER_URL in scripts/main.gd, then restart the game.")
 		return
 	retrying = true
 	retry_t = 4.0
@@ -250,6 +361,9 @@ func _on_connection_failed() -> void:
 
 func _on_server_disconnected() -> void:
 	in_game = false
+	paused = false
+	pause_menu.close()
+	_refresh_touch()
 	players_view.clear()
 	worms_view.clear()
 	_set_hud_visible(false)
@@ -278,12 +392,15 @@ func _client_connection_tick(delta: float) -> void:
 
 func _unhandled_input(event: InputEvent) -> void:
 	if in_game and event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_ESCAPE:
-		_leave_to_rooms()
+		_set_paused(not paused)
 
 
 func _leave_to_rooms() -> void:
 	rpc_leave_room.rpc_id(1)
 	in_game = false
+	paused = false
+	pause_menu.close()
+	_refresh_touch()
 	players_view.clear()
 	worms_view.clear()
 	_set_hud_visible(false)
@@ -304,6 +421,12 @@ func _on_signup_requested(username: String, password: String) -> void:
 func _on_login_requested(username: String, password: String) -> void:
 	menu.set_status("Logging in...")
 	rpc_auth.rpc_id(1, "login", username, password)
+
+
+func _on_logout_requested() -> void:
+	rpc_logout.rpc_id(1)
+	my_name = ""
+	menu.show_login("You have been logged out.")
 
 
 func _on_create_room_requested() -> void:
@@ -476,6 +599,16 @@ func rpc_auth(mode: String, uname: String, password: String) -> void:
 
 
 @rpc("any_peer", "reliable")
+func rpc_logout() -> void:
+	if not is_server:
+		return
+	var id := multiplayer.get_remote_sender_id()
+	_leave_room(id)
+	authed.erase(id)
+	auth_attempts.erase(id)
+
+
+@rpc("any_peer", "reliable")
 func rpc_create_room() -> void:
 	if not is_server:
 		return
@@ -605,7 +738,8 @@ func rpc_notice(message: String) -> void:
 @rpc("authority", "reliable")
 func rpc_auth_ok(display_name: String) -> void:
 	my_name = display_name
-	menu.show_rooms("Welcome, %s! Create a room or enter a code." % display_name)
+	menu.set_player(display_name)
+	menu.show_rooms("")
 
 
 @rpc("authority", "reliable")
@@ -627,8 +761,11 @@ func rpc_enter_room(code: String, display_name: String, tiles: PackedByteArray, 
 	camera.position = my_pos
 	camera.reset_smoothing()
 	in_game = true
+	paused = false
+	pause_menu.close()
 	menu.visible = false
 	_set_hud_visible(true)
+	_refresh_touch()
 	_toast("Room %s - tell your friends the code! Run from the worms!" % code)
 
 
@@ -713,7 +850,10 @@ func _process(delta: float) -> void:
 	if toast_time > 0.0:
 		toast_time -= delta
 		if toast_time <= 0.0:
-			toast_label.visible = false
+			toast_panel.visible = false
+
+	var vs := get_viewport_rect().size
+	rotate_overlay.visible = use_touch_ui and vs.y > vs.x * 1.1
 
 	_client_connection_tick(delta)
 
@@ -725,15 +865,24 @@ func _process(delta: float) -> void:
 
 
 func _update_local_player(delta: float) -> void:
-	var left := Input.is_physical_key_pressed(KEY_A) or Input.is_physical_key_pressed(KEY_LEFT)
-	var right := Input.is_physical_key_pressed(KEY_D) or Input.is_physical_key_pressed(KEY_RIGHT)
-	var jump := Input.is_physical_key_pressed(KEY_W) or Input.is_physical_key_pressed(KEY_UP) or Input.is_physical_key_pressed(KEY_SPACE)
+	var left := false
+	var right := false
+	var jump := false
+	if not paused:
+		left = Input.is_physical_key_pressed(KEY_A) or Input.is_physical_key_pressed(KEY_LEFT)
+		right = Input.is_physical_key_pressed(KEY_D) or Input.is_physical_key_pressed(KEY_RIGHT)
+		jump = Input.is_physical_key_pressed(KEY_W) or Input.is_physical_key_pressed(KEY_UP) or Input.is_physical_key_pressed(KEY_SPACE)
 
 	var dir := 0.0
 	if left:
 		dir -= 1.0
 	if right:
 		dir += 1.0
+	if use_touch_ui and not paused:
+		if touch.move_dir != 0.0:
+			dir = touch.move_dir
+		if touch.jump_held:
+			jump = true
 	if dir != 0.0:
 		my_facing = int(dir)
 
@@ -747,22 +896,33 @@ func _update_local_player(delta: float) -> void:
 
 	camera.position = my_pos
 
-	# break / place blocks
+	# break / place blocks (mouse, or touch when touch controls are on)
+	touch.blocks_text = str(my_blocks)
+	var want_break := false
+	var want_place := false
+	if use_touch_ui:
+		aim_world = get_canvas_transform().affine_inverse() * touch.aim_screen
+		if not paused and touch.aim_active:
+			want_place = touch.place_mode
+			want_break = not touch.place_mode
+	else:
+		aim_world = get_global_mouse_position()
+		if not paused:
+			want_break = Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
+			want_place = Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT)
+
 	action_cd -= delta
-	if action_cd <= 0.0:
-		var want_break := Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
-		var want_place := Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT)
-		if want_break or want_place:
-			var tile: Vector2i = world.world_to_tile(get_global_mouse_position())
-			var c := Vector2(tile.x * T + T * 0.5, tile.y * T + T * 0.5)
-			if my_pos.distance_to(c) <= REACH:
-				var t: int = world.get_tile(tile.x, tile.y)
-				if want_break and t != WorldScript.AIR and t != WorldScript.BEDROCK:
-					rpc_break.rpc_id(1, tile.x, tile.y)
-					action_cd = 0.12
-				elif want_place and t == WorldScript.AIR and my_blocks > 0:
-					rpc_place.rpc_id(1, tile.x, tile.y)
-					action_cd = 0.12
+	if action_cd <= 0.0 and (want_break or want_place):
+		var tile: Vector2i = world.world_to_tile(aim_world)
+		var c := Vector2(tile.x * T + T * 0.5, tile.y * T + T * 0.5)
+		if my_pos.distance_to(c) <= REACH:
+			var t: int = world.get_tile(tile.x, tile.y)
+			if want_break and t != WorldScript.AIR and t != WorldScript.BEDROCK:
+				rpc_break.rpc_id(1, tile.x, tile.y)
+				action_cd = 0.12
+			elif want_place and t == WorldScript.AIR and my_blocks > 0:
+				rpc_place.rpc_id(1, tile.x, tile.y)
+				action_cd = 0.12
 
 	# tell the server where we are
 	send_timer += delta
@@ -1026,7 +1186,9 @@ func _draw() -> void:
 	_draw_player(my_pos, my_facing, my_name, my_invuln, font)
 
 	# block cursor
-	var tile: Vector2i = world.world_to_tile(get_global_mouse_position())
+	if paused or (use_touch_ui and not touch.aim_active):
+		return
+	var tile: Vector2i = world.world_to_tile(aim_world)
 	var c := Vector2(tile.x * T + T * 0.5, tile.y * T + T * 0.5)
 	var ok := my_pos.distance_to(c) <= REACH
 	var col := Color(1, 1, 1, 0.9) if ok else Color(1, 0.3, 0.3, 0.6)
